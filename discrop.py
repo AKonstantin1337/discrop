@@ -27,7 +27,7 @@ client = None
 thread = None
 settings = obs.obs_data_create()
 discord_source = None
-
+discord_sources = {}
 
 class Client(discord.Client):
 
@@ -183,7 +183,7 @@ def script_properties(): # OBS script interface.
     obs.obs_property_set_long_description(p, '<p>Rebuild the list of sources above. Useful for when you’ve made major changes to your scenes. This won’t reset your choice, unless it’s no longer available.</p>')
     p = obs.obs_properties_add_bool(grp, 'item_right_below', 'Show/hide item right below for audio-only')
     obs.obs_property_set_long_description(p, '<p>Requires an item right below each Discord item, which the script will show when the participant has no video, and hide otherwise</p>')
-
+    # p = obs.obs_properties_add_button(grp, 'console_log', 'Console Log', console_log)
     obs.obs_properties_add_group(props, 'general', 'General', obs.OBS_GROUP_NORMAL, grp)
 
     grp = obs.obs_properties_create()
@@ -192,8 +192,10 @@ def script_properties(): # OBS script interface.
     p = obs.obs_properties_add_button(grp, 'refresh_names', 'Refresh names', populate_participants)
     obs.obs_property_set_long_description(p, '<p>Rebuild the participant lists. Useful when there have been nickname changes, or someone has joined the server. Don’t worry— it won’t reset each choice, unless a selected participant left the server.</p>')
     for i in range(SLOTS):
-        p = obs.obs_properties_add_list(grp, f'participant{i}', None, obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_STRING)
+        p = obs.obs_properties_add_list(grp, f'participant{i}', f'Participant {i+1}', obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_STRING)
         obs.obs_property_set_long_description(p, '<p>Participant to appear at the ' + ordinal(i + 1) + ' capture item from the top of the scene</p>')
+        p = obs.obs_properties_add_list(grp, f'discord_source{i}', f'Discord source {i+1}', obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_STRING)
+        obs.obs_property_set_long_description(p,'<p>Source that is capturing the Discord call. <strong>CAUTION: this will irreversibly modify all items belonging to the source you pick!</strong></p>')
     obs.obs_properties_add_group(props, 'participant_layout', 'Participant layout', obs.OBS_GROUP_NORMAL, grp)
 
     populate_sources(props)
@@ -205,14 +207,27 @@ def script_properties(): # OBS script interface.
     obs.obs_properties_apply_settings(props, settings)
     return props
 
+# def console_log(props, p=None, _settings=None):
+#     global discord_source, discord_sources
+#
+#     return True
 
 def script_tick(seconds): # OBS script interface.
-    global discord_source
+    global discord_source, discord_sources
 
     source_name = obs.obs_data_get_string(settings, 'discord_source')
     if source_name != obs.obs_source_get_name(discord_source):
         obs.obs_source_release(discord_source) # Doesn’t error even if discord_source == None.
         discord_source = obs.obs_get_source_by_name(source_name)
+
+
+    for name in [f'discord_source{i}' for i in range(SLOTS)]:
+        source_name = obs.obs_data_get_string(settings, name)
+        if (name[-1:] in discord_sources.keys()) and (source_name != obs.obs_source_get_name(discord_sources[name[-1:]])):
+                obs.obs_source_release(discord_sources[name[-1:]])  # Doesn’t error even if discord_source == None.
+                discord_sources[name[-1:]] = obs.obs_get_source_by_name(source_name)
+        else:
+            discord_sources[name[-1:]] = obs.obs_get_source_by_name(source_name)
 
     if not client:
         return
@@ -344,6 +359,136 @@ def script_tick(seconds): # OBS script interface.
         obs.sceneitem_list_release(items)
     obs.source_list_release(scene_sources)
 
+    for i in range(SLOTS):
+        source_width = obs.obs_source_get_width(discord_sources[str(i)])
+        source_height = obs.obs_source_get_height(discord_sources[str(i)])
+
+        margin_top = MARGIN_TOP
+        if not obs.obs_data_get_bool(settings, 'full_screen'):
+            margin_top = margin_top + TITLE_BAR
+
+        # Get Discord call layout distribution and caller size.
+        people = [x for x in client.video]  # Mutability and shiz.
+        nonvideo = obs.obs_data_get_bool(settings, 'show_nonvideo_participants')
+        if nonvideo:
+            people += client.audio
+        count = len(people)
+        if count == 1 and (not client.audio or not client.video and nonvideo):
+            count = 2  # Discord adds a call to action that occupies the same space as a second caller.
+        rows = None
+        cols = None
+        width = 0
+        height = None
+        offsetx = 0
+        offsety = 0
+        offset_last = None
+        if source_width and source_height:
+            totalw = source_width - MARGIN_SIDES * 2
+            totalh = source_height - margin_top - MARGIN_BTM
+            if totalw > 0 and totalh > 0:
+                wide = None
+                # Discord packs the callers in as many columns as possible, unless their videos appear bigger with fewer columns.
+                for c in reversed(range(1, count + 1)):
+                    r = math.ceil(count / c)
+                    w = (totalw - CALLER_SPACING * (c - 1)) / c
+                    h = (totalh - CALLER_SPACING * (r - 1)) / r
+                    wi = w / h > CALLER_ASPECT
+                    if wi:
+                        w = h * CALLER_ASPECT
+                    if w > width:
+                        rows = r
+                        cols = c
+                        width = w
+                        height = h
+                        wide = wi
+                if rows:
+                    # If the window is wider or taller than the callers fit in, Discord will center them as a whole.
+                    inner_width = (width * cols + CALLER_SPACING * (cols - 1))
+                    if wide:  # Wider than needed, therefore center horizontally.
+                        offsetx = (totalw - inner_width) / 2
+                    else:  # Taller than needed, therefore center vertically.
+                        height = width / CALLER_ASPECT  # We compared using widths only before, so height needs to be adjusted.
+                        offsety = (totalh - (height * rows + CALLER_SPACING * (rows - 1))) / 2
+
+                    # If last row contains fewer callers than columns, Discord will center it.
+                    offset_last = count % cols
+                    if offset_last > 0:
+                        offset_last = (inner_width - (width * offset_last + CALLER_SPACING * (offset_last - 1))) / 2
+
+        # Apply necessary changes to relevant scene items.
+        scene_sources = obs.obs_frontend_get_scenes()
+
+        for scene_src in scene_sources:
+            scene = obs.obs_scene_from_source(scene_src)  # Shouldn’t be released.
+            items = obs.obs_scene_enum_items(scene)
+            i = 0
+            next_vis = None
+            for item in reversed(items):
+                _next_vis = None
+                if obs.obs_sceneitem_get_source(item) == discord_sources[str(i)]:  # Shouldn’t be released.
+                    uid = int(obs.obs_data_get_string(settings, f'participant{i}') or -1)
+                    visible = True
+                    try:
+                        index = people.index(uid)
+                    except (IndexError, ValueError):
+                        visible = False
+                    i += 1
+                    obs.obs_sceneitem_set_visible(item, visible)
+                    if visible and rows:
+                        crop = obs.obs_sceneitem_crop()
+                        obs.obs_sceneitem_get_crop(item, crop)
+                        scale = obs.vec2()
+                        obs.obs_sceneitem_get_scale(item, scale)
+                        bounds = obs.vec2()
+                        obs.obs_sceneitem_get_bounds(item, bounds)
+
+                        # If item was set to not use a bounding box policy, calculate it from its other transform properties.
+                        if obs.obs_sceneitem_get_bounds_type(item) == obs.OBS_BOUNDS_NONE:
+                            obs.vec2_set(bounds, scale.x * (source_width - crop.right - crop.left),
+                                         scale.y * (source_height - crop.bottom - crop.top))
+                            obs.obs_sceneitem_set_bounds(item, bounds)
+
+                        obs.obs_sceneitem_set_bounds_type(item, obs.OBS_BOUNDS_SCALE_OUTER)
+                        obs.obs_sceneitem_set_bounds_alignment(item,
+                                                               0)  # obs.OBS_ALIGN_CENTER doesn’t seem to be implemented.
+
+                        # Get top left corner of this caller.
+                        r = math.ceil((index + 1) / cols)
+                        c = index % cols + 1
+                        x = MARGIN_SIDES + offsetx + (width + CALLER_SPACING) * (c - 1)
+                        if r == rows:
+                            x = x + offset_last
+                        y = margin_top + offsety + (height + CALLER_SPACING) * (r - 1)
+
+                        # Make sure the crop doesn’t overflow the item bounds.
+                        aspect = bounds.x / bounds.y
+                        clipx = 0
+                        clipy = 0
+                        if aspect > CALLER_ASPECT:
+                            clipy = (height - width / aspect) / 2
+                        else:
+                            clipx = (width - height * aspect) / 2
+
+                        crop.left = math.ceil(x + CALLER_BORDER + clipx)
+                        crop.top = math.ceil(y + CALLER_BORDER + clipy)
+                        crop.right = source_width - int(x + width - CALLER_BORDER - clipx)
+                        crop.bottom = source_height - int(y + height - CALLER_BORDER - clipy)
+                        obs.obs_sceneitem_set_crop(item, crop)
+
+                        sx = abs(scale.x)
+                        if uid == int(obs.obs_data_get_string(settings, 'myself') or -1) and uid in client.video:
+                            sx = -sx
+                        sy = scale.y
+                        obs.vec2_set(scale, sx, sy)
+                        obs.obs_sceneitem_set_scale(item, scale)
+                    if not nonvideo and obs.obs_data_get_bool(settings, 'item_right_below'):
+                        _next_vis = uid in client.audio
+                elif next_vis is not None:
+                    obs.obs_sceneitem_set_visible(item, next_vis)
+                next_vis = _next_vis
+            obs.sceneitem_list_release(items)
+        obs.source_list_release(scene_sources)
+
 
 def script_unload(): # OBS script interface.
     client.loop.call_soon_threadsafe(lambda: asyncio.ensure_future(client.close()))
@@ -383,6 +528,13 @@ def populate_sources(props, p=None, _settings=None):
     obs.source_list_release(sources)
     for n in sorted(labels, key=lambda x: x.lower()):
         obs.obs_property_list_add_string(p, labels[n], n)
+
+    for name in [f'discord_source{i}' for i in range(SLOTS)]:
+        p = obs.obs_properties_get(props, name)
+        obs.obs_property_list_clear(p)
+        obs.obs_property_list_add_string(p, '(none)', '')
+        for n in sorted(labels, key=lambda x: x.lower()):
+            obs.obs_property_list_add_string(p, labels[n], n)
     return True
 
 
